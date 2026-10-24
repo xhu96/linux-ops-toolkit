@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# healthcheck: one-shot host health report with Nagios-style exit codes
+# (0 OK, 1 WARNING, 2 CRITICAL), so it works from cron, a monitoring agent or CI.
+#
+#   healthcheck                         # human-readable
+#   healthcheck --json                  # machine-readable
+#   healthcheck --service nginx --service docker --tls example.com
+#
+# Thresholds are percentages; override with --disk-warn 70 --disk-crit 85 etc.
+
+# Resolve symlinks so the scripts work when linked into /usr/local/bin.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source-path=SCRIPTDIR/..
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/../lib/common.sh"
+
+DISK_WARN=80 DISK_CRIT=90
+INODE_WARN=80 INODE_CRIT=90
+MEM_WARN=85 MEM_CRIT=95
+LOAD_WARN=1.5 LOAD_CRIT=3     # 1-minute load per CPU
+TLS_WARN_DAYS=21 TLS_CRIT_DAYS=7
+JSON=0
+SERVICES=()
+TLS_HOSTS=()
+
+# Data sources, overridable so the checks can be tested without a real host.
+DF_CMD="${DF_CMD:-df -P -x tmpfs -x devtmpfs -x overlay -x squashfs}"
+DF_INODE_CMD="${DF_INODE_CMD:-df -P -i -x tmpfs -x devtmpfs -x overlay -x squashfs}"
+MEMINFO="${MEMINFO:-/proc/meminfo}"
+LOADAVG="${LOADAVG:-/proc/loadavg}"
+NPROC="${NPROC:-$(nproc 2>/dev/null || echo 1)}"
+
+RESULTS=()   # "status|check|message"
+WORST=0
+
+usage() {
+  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+record() {
+  local status="$1" check="$2" msg="$3" code=0
+  case "$status" in WARNING) code=1 ;; CRITICAL) code=2 ;; esac
+  (( code > WORST )) && WORST=$code
+  RESULTS+=("${status}|${check}|${msg}")
+}
+
+level() {
+  # level VALUE WARN CRIT -> OK|WARNING|CRITICAL (works with decimals)
+  awk -v v="$1" -v w="$2" -v c="$3" 'BEGIN { print (v >= c) ? "CRITICAL" : (v >= w) ? "WARNING" : "OK" }'
+}
+
+check_disk() {
+  local mount pct
+  while read -r _ _ _ _ pct mount; do
+    pct="${pct%\%}"
+    [[ "$pct" =~ ^[0-9]+$ ]] || continue
+    record "$(level "$pct" "$DISK_WARN" "$DISK_CRIT")" "disk:${mount}" "${pct}% used"
+  done < <($DF_CMD | tail -n +2)
+}
+
+check_inodes() {
+  local mount pct
+  while read -r _ _ _ _ pct mount; do
+    pct="${pct%\%}"
+    [[ "$pct" =~ ^[0-9]+$ ]] || continue
+    record "$(level "$pct" "$INODE_WARN" "$INODE_CRIT")" "inodes:${mount}" "${pct}% used"
+  done < <($DF_INODE_CMD | tail -n +2)
+}
+
+check_memory() {
+  local total avail pct
+  total=$(awk '/^MemTotal:/ {print $2}' "$MEMINFO")
+  avail=$(awk '/^MemAvailable:/ {print $2}' "$MEMINFO")
+  pct=$(( (total - avail) * 100 / total ))
+  record "$(level "$pct" "$MEM_WARN" "$MEM_CRIT")" "memory" "${pct}% used ($(( avail / 1024 )) MiB available)"
+}
+
+check_load() {
+  local load1 per_cpu
+  load1=$(awk '{print $1}' "$LOADAVG")
+  per_cpu=$(awk -v l="$load1" -v n="$NPROC" 'BEGIN { printf "%.2f", l / n }')
+  record "$(level "$per_cpu" "$LOAD_WARN" "$LOAD_CRIT")" "load" "${load1} on ${NPROC} CPU(s) (${per_cpu} per CPU)"
+}
+
+check_failed_units() {
+  has_systemd || return 0
+  local failed
+  failed=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}' | paste -sd, -)
+  if [[ -n "$failed" ]]; then
+    record WARNING "systemd" "failed units: ${failed}"
+  else
+    record OK "systemd" "no failed units"
+  fi
+}
+
+check_service() {
+  local svc="$1"
+  if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    record OK "service:${svc}" "active"
+  else
+    record CRITICAL "service:${svc}" "not active"
+  fi
+}
+
+check_tls() {
+  local host="$1" end days
+  end=$(echo | timeout 10 openssl s_client -servername "$host" -connect "${host}:443" 2>/dev/null \
+    | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2) || true
+  if [[ -z "$end" ]]; then
+    record CRITICAL "tls:${host}" "could not read certificate"
+    return
+  fi
+  days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+  local status=OK
+  (( days <= TLS_WARN_DAYS )) && status=WARNING
+  (( days <= TLS_CRIT_DAYS )) && status=CRITICAL
+  record "$status" "tls:${host}" "expires in ${days} days"
+}
+
+report() {
+  local names=(OK WARNING CRITICAL)
+  if [[ "$JSON" == 1 ]]; then
+    local r items=()
+    for r in "${RESULTS[@]}"; do
+      IFS='|' read -r s c m <<<"$r"
+      items+=("$(jq -cn --arg s "$s" --arg c "$c" --arg m "$m" '{status:$s,check:$c,message:$m}')")
+    done
+    printf '%s\n' "${items[@]}" | jq -s --arg host "$(hostname)" --arg overall "${names[$WORST]}" \
+      '{host:$host, status:$overall, checks:.}'
+  else
+    local r
+    for r in "${RESULTS[@]}"; do
+      IFS='|' read -r s c m <<<"$r"
+      printf '%-9s %-28s %s\n' "$s" "$c" "$m"
+    done
+    printf '\noverall: %s\n' "${names[$WORST]}"
+  fi
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) JSON=1; shift ;;
+      --service) SERVICES+=("$2"); shift 2 ;;
+      --tls) TLS_HOSTS+=("$2"); shift 2 ;;
+      --disk-warn) DISK_WARN="$2"; shift 2 ;;
+      --disk-crit) DISK_CRIT="$2"; shift 2 ;;
+      --mem-warn) MEM_WARN="$2"; shift 2 ;;
+      --mem-crit) MEM_CRIT="$2"; shift 2 ;;
+      --load-warn) LOAD_WARN="$2"; shift 2 ;;
+      --load-crit) LOAD_CRIT="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "unknown option: $1" ;;
+    esac
+  done
+  check_disk
+  check_inodes
+  check_memory
+  check_load
+  check_failed_units
+  local s h
+  for s in "${SERVICES[@]}"; do check_service "$s"; done
+  for h in "${TLS_HOSTS[@]}"; do check_tls "$h"; done
+  report
+  exit "$WORST"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

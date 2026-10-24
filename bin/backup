@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# backup: compressed, checksummed, rotated backups of directories, with optional
+# upload to S3. Safe to run from cron: a lock prevents overlapping runs and any
+# failure exits non-zero.
+#
+#   backup --dest /var/backups/app --keep 7 /etc /srv/app
+#   backup --dest /var/backups/app --s3 s3://my-bucket/host1 --exclude '*.log' /srv/app
+#   backup --verify /var/backups/app/backup-20261024T030000Z.tar.gz
+
+# Resolve symlinks so the scripts work when linked into /usr/local/bin.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source-path=SCRIPTDIR/..
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/../lib/common.sh"
+
+DEST=""
+KEEP=7
+S3_URI=""
+NAME="backup"
+EXCLUDES=()
+SOURCES=()
+VERIFY=""
+
+usage() {
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<USAGE
+
+Options:
+  --dest DIR        where archives are written (required)
+  --keep N          keep the N most recent archives (default: 7)
+  --name NAME       archive name prefix (default: backup)
+  --exclude GLOB    pattern to exclude, repeatable
+  --s3 URI          also upload to S3 (needs the aws CLI)
+  --verify FILE     check an archive against its .sha256 and list it
+  --dry-run         show what would happen
+USAGE
+}
+
+verify() {
+  local archive="$1"
+  [[ -f "$archive" && -f "${archive}.sha256" ]] || die "missing ${archive} or its .sha256"
+  (cd "$(dirname "$archive")" && sha256sum --quiet -c "$(basename "$archive").sha256") \
+    || die "checksum mismatch: ${archive}"
+  tar -tzf "$archive" >/dev/null || die "archive is corrupt: ${archive}"
+  ok "verified ${archive} ($(tar -tzf "$archive" | wc -l) entries)"
+}
+
+rotate() {
+  local old
+  mapfile -t old < <(find "$DEST" -maxdepth 1 -name "${NAME}-*.tar.gz" -printf '%f\n' | sort -r | tail -n +"$((KEEP + 1))")
+  for f in "${old[@]}"; do
+    run rm -f "${DEST}/${f}" "${DEST}/${f}.sha256"
+    info "rotated out ${f}"
+  done
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dest) DEST="$2"; shift 2 ;;
+      --keep) KEEP="$2"; shift 2 ;;
+      --name) NAME="$2"; shift 2 ;;
+      --exclude) EXCLUDES+=("--exclude=$2"); shift 2 ;;
+      --s3) S3_URI="${2%/}"; shift 2 ;;
+      --verify) VERIFY="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) usage >&2; die "unknown option: $1" ;;
+      *) SOURCES+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ -n "$VERIFY" ]]; then verify "$VERIFY"; return; fi
+
+  [[ -n "$DEST" ]] || die "--dest is required"
+  [[ ${#SOURCES[@]} -gt 0 ]] || die "nothing to back up"
+  [[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || die "--keep must be a positive integer"
+  [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid --name"
+  local src
+  for src in "${SOURCES[@]}"; do [[ -e "$src" ]] || die "source does not exist: ${src}"; done
+  if [[ -n "$S3_URI" ]]; then
+    [[ "$S3_URI" == s3://* ]] || die "--s3 must start with s3://"
+    command -v aws >/dev/null || die "--s3 needs the aws CLI"
+  fi
+
+  run mkdir -p "$DEST"
+  local lockfile="${DEST}/.${NAME}.lock"
+  [[ -d "$DEST" ]] || lockfile="/tmp/.${NAME}.lock" # dry run: DEST was not created
+  exec 9>"$lockfile"
+  flock -n 9 || die "another backup named ${NAME} is running"
+
+  local stamp archive
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  archive="${DEST}/${NAME}-${stamp}.tar.gz"
+
+  info "backing up ${SOURCES[*]} -> ${archive}"
+  # Write to a temp name and rename at the end: a crash never leaves a half
+  # archive that looks complete.
+  run tar --create --gzip --file "${archive}.partial" --absolute-names "${EXCLUDES[@]}" "${SOURCES[@]}"
+  run mv "${archive}.partial" "$archive"
+  if [[ "$DRY_RUN" != 1 ]]; then
+    (cd "$DEST" && sha256sum "$(basename "$archive")" >"$(basename "$archive").sha256")
+    ok "wrote $(du -h "$archive" | cut -f1) archive"
+  fi
+
+  if [[ -n "$S3_URI" ]]; then
+    run aws s3 cp --only-show-errors "$archive" "${S3_URI}/"
+    run aws s3 cp --only-show-errors "${archive}.sha256" "${S3_URI}/"
+    ok "uploaded to ${S3_URI}/"
+  fi
+
+  rotate
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
