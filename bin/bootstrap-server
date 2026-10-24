@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# bootstrap-server: turn a fresh Ubuntu/Debian host into a hardened, ready-to-use
+# server. Idempotent: running it twice changes nothing the second time.
+#
+#   sudo bootstrap-server --user deploy --ssh-key-file ~/.ssh/id_ed25519.pub
+#   sudo bootstrap-server --dry-run ...      # show what would change
+#
+# See docs/hardening.md for what each step does and why.
+
+# Resolve symlinks so the scripts work when linked into /usr/local/bin.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source-path=SCRIPTDIR/..
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/../lib/common.sh"
+
+USER_NAME="deploy"
+SSH_KEY=""
+SSH_PORT=22
+TIMEZONE="UTC"
+SWAP_SIZE="1G"
+INSTALL_DOCKER=1
+FIREWALL=1
+SSHD_DIR="${SSHD_DIR:-/etc/ssh/sshd_config.d}"
+LOG_FILE="${LOG_FILE:-/var/log/bootstrap-server.log}"
+CHANGED=()
+
+usage() {
+  cat <<USAGE
+Usage: bootstrap-server [options]
+
+  --user NAME          admin user to create (default: deploy)
+  --ssh-key KEY        public key for that user
+  --ssh-key-file PATH  read the public key from a file
+  --ssh-port PORT      SSH port (default: 22)
+  --timezone TZ        system timezone (default: UTC)
+  --swap SIZE          swap file size, 0 to skip (default: 1G)
+  --no-docker          do not install Docker
+  --no-firewall        do not configure ufw
+  --dry-run            print what would change, change nothing
+  -h, --help           this help
+USAGE
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user) USER_NAME="$2"; shift 2 ;;
+      --ssh-key) SSH_KEY="$2"; shift 2 ;;
+      --ssh-key-file) SSH_KEY="$(<"$2")"; shift 2 ;;
+      --ssh-port) SSH_PORT="$2"; shift 2 ;;
+      --timezone) TIMEZONE="$2"; shift 2 ;;
+      --swap) SWAP_SIZE="$2"; shift 2 ;;
+      --no-docker) INSTALL_DOCKER=0; shift ;;
+      --no-firewall) FIREWALL=0; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "unknown option: $1" ;;
+    esac
+  done
+  [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid user name: $USER_NAME"
+  [[ "$SSH_PORT" =~ ^[0-9]+$ && "$SSH_PORT" -ge 1 && "$SSH_PORT" -le 65535 ]] || die "invalid port: $SSH_PORT"
+  if [[ -n "$SSH_KEY" && ! "$SSH_KEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com)\  ]]; then
+    die "--ssh-key does not look like an OpenSSH public key"
+  fi
+}
+
+changed() { CHANGED+=("$1"); ok "$1"; }
+
+preflight() {
+  require_root
+  local id
+  id="$(os_id)"
+  case "$id" in
+    ubuntu|debian) info "detected ${id}" ;;
+    *) die "unsupported OS: ${id} (Ubuntu and Debian only)" ;;
+  esac
+  if in_container; then
+    warn "running in a container: firewall, sysctl, swap and service restarts are skipped"
+    FIREWALL=0
+    SWAP_SIZE=0
+  fi
+}
+
+install_packages() {
+  local pkgs=(ca-certificates curl gnupg jq htop unattended-upgrades fail2ban python3-systemd openssh-server sudo tzdata)
+  [[ "$FIREWALL" == 1 ]] && pkgs+=(ufw)
+  local missing=()
+  for p in "${pkgs[@]}"; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || missing+=("$p")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    info "packages already installed"
+    return
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  run apt-get update -qq
+  run apt-get install -y -qq --no-install-recommends "${missing[@]}"
+  changed "installed packages: ${missing[*]}"
+}
+
+configure_user() {
+  if ! id "$USER_NAME" >/dev/null 2>&1; then
+    run useradd --create-home --shell /bin/bash --groups sudo "$USER_NAME"
+    changed "created user ${USER_NAME}"
+  fi
+  # Key-only accounts have no password, so sudo must not ask for one.
+  if write_file "/etc/sudoers.d/90-${USER_NAME}" 0440 <<<"${USER_NAME} ALL=(ALL) NOPASSWD:ALL"; then
+    [[ "$DRY_RUN" == 1 ]] || visudo -cf "/etc/sudoers.d/90-${USER_NAME}" >/dev/null \
+      || { rm -f "/etc/sudoers.d/90-${USER_NAME}"; die "sudoers drop-in failed validation"; }
+    changed "passwordless sudo for ${USER_NAME}"
+  fi
+
+  [[ -n "$SSH_KEY" ]] || return 0
+  local home ssh_dir keys
+  home="$(getent passwd "$USER_NAME" | cut -d: -f6 || true)"
+  home="${home:-/home/${USER_NAME}}"
+  ssh_dir="${home}/.ssh"
+  keys="${ssh_dir}/authorized_keys"
+  if ! grep -qxF "$SSH_KEY" "$keys" 2>/dev/null; then
+    run install -d -m 700 -o "$USER_NAME" -g "$USER_NAME" "$ssh_dir"
+    if [[ "$DRY_RUN" == 1 ]]; then
+      info "[dry-run] would add key to ${keys}"
+    else
+      printf '%s\n' "$SSH_KEY" >>"$keys"
+      chown "$USER_NAME:$USER_NAME" "$keys"
+      chmod 600 "$keys"
+    fi
+    changed "authorized SSH key for ${USER_NAME}"
+  fi
+}
+
+user_has_key() {
+  local home
+  home="$(getent passwd "$USER_NAME" | cut -d: -f6 || true)"
+  [[ -s "${home}/.ssh/authorized_keys" ]]
+}
+
+harden_ssh() {
+  # Lockout protection: never disable passwords unless someone can still log in with a key.
+  local password_auth="no"
+  if [[ "$DRY_RUN" != 1 ]] && ! user_has_key; then
+    warn "${USER_NAME} has no SSH key: keeping password authentication ON to avoid a lockout"
+    password_auth="yes"
+  fi
+  if write_file "${SSHD_DIR}/10-hardening.conf" 0644 <<CONF
+# Managed by bootstrap-server
+Port ${SSH_PORT}
+PermitRootLogin no
+PasswordAuthentication ${password_auth}
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+X11Forwarding no
+AllowAgentForwarding no
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+AllowUsers ${USER_NAME}
+CONF
+  then
+    if [[ "$DRY_RUN" != 1 ]]; then
+      mkdir -p /run/sshd
+      sshd -t || { rm -f "${SSHD_DIR}/10-hardening.conf"; die "sshd config invalid, change reverted"; }
+      if has_systemd && ! in_container; then
+        configure_ssh_socket
+        # try-reload: on socket-activated systems ssh.service may not be running yet.
+        systemctl try-reload-or-restart ssh 2>/dev/null || systemctl try-reload-or-restart sshd
+      fi
+    fi
+    changed "hardened sshd (port ${SSH_PORT}, root login off, password auth ${password_auth})"
+  fi
+}
+
+# Ubuntu 22.10+ starts sshd through ssh.socket, which ignores "Port" in
+# sshd_config: the listening port has to be set on the socket unit instead.
+configure_ssh_socket() {
+  systemctl is-enabled --quiet ssh.socket 2>/dev/null || return 0
+  local dropin=/etc/systemd/system/ssh.socket.d/10-port.conf
+  if [[ "$SSH_PORT" == 22 ]]; then
+    [[ -f "$dropin" ]] && rm -f "$dropin" && systemctl daemon-reload && systemctl restart ssh.socket
+    return 0
+  fi
+  if write_file "$dropin" 0644 <<CONF
+[Socket]
+ListenStream=
+ListenStream=${SSH_PORT}
+CONF
+  then
+    systemctl daemon-reload
+    systemctl restart ssh.socket
+    changed "ssh.socket now listens on ${SSH_PORT}"
+  fi
+}
+
+configure_firewall() {
+  [[ "$FIREWALL" == 1 ]] || { info "firewall skipped"; return; }
+  if ufw status 2>/dev/null | grep -q "Status: active" && ufw status | grep -q "^${SSH_PORT}/tcp"; then
+    info "ufw already active"
+    return
+  fi
+  run ufw default deny incoming
+  run ufw default allow outgoing
+  run ufw limit "${SSH_PORT}/tcp" comment ssh
+  run ufw --force enable
+  changed "ufw enabled: deny incoming, rate-limited SSH on ${SSH_PORT}"
+}
+
+configure_fail2ban() {
+  if write_file /etc/fail2ban/jail.d/sshd.local 0644 <<CONF
+[sshd]
+enabled  = true
+port     = ${SSH_PORT}
+backend  = systemd
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+CONF
+  then
+    if has_systemd && ! in_container && [[ "$DRY_RUN" != 1 ]]; then systemctl enable --now fail2ban; systemctl restart fail2ban; fi
+    changed "fail2ban protecting sshd"
+  fi
+}
+
+configure_auto_updates() {
+  if write_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'CONF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+CONF
+  then
+    changed "unattended security upgrades enabled"
+  fi
+}
+
+configure_kernel() {
+  if write_file /etc/sysctl.d/90-hardening.conf 0644 <<'CONF'
+# Managed by bootstrap-server
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+fs.protected_symlinks = 1
+fs.protected_hardlinks = 1
+CONF
+  then
+    in_container || run sysctl --system >/dev/null
+    changed "kernel network hardening (sysctl)"
+  fi
+}
+
+configure_journald() {
+  if write_file /etc/systemd/journald.conf.d/size.conf 0644 <<'CONF'
+[Journal]
+SystemMaxUse=500M
+MaxRetentionSec=1month
+CONF
+  then
+    if has_systemd && ! in_container && [[ "$DRY_RUN" != 1 ]]; then systemctl restart systemd-journald; fi
+    changed "journald capped at 500M / 1 month"
+  fi
+}
+
+configure_timezone() {
+  local current
+  current="$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##' || true)"
+  [[ "$current" == "$TIMEZONE" ]] && return
+  [[ -e "/usr/share/zoneinfo/${TIMEZONE}" ]] || die "unknown timezone: ${TIMEZONE}"
+  run ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+  if [[ "$DRY_RUN" != 1 ]]; then printf '%s\n' "$TIMEZONE" >/etc/timezone; fi
+  changed "timezone set to ${TIMEZONE}"
+}
+
+configure_swap() {
+  [[ "$SWAP_SIZE" != 0 ]] || return 0
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -q .; then
+    info "swap already present"
+    return
+  fi
+  run fallocate -l "$SWAP_SIZE" /swapfile
+  run chmod 600 /swapfile
+  run mkswap /swapfile
+  run swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || run sh -c 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
+  changed "swap file ${SWAP_SIZE}"
+}
+
+install_docker() {
+  [[ "$INSTALL_DOCKER" == 1 ]] || return 0
+  if ! command -v docker >/dev/null 2>&1; then
+    local id codename arch
+    id="$(os_id)"
+    # shellcheck disable=SC1091
+    codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+    arch="$(dpkg --print-architecture)"
+    run install -m 0755 -d /etc/apt/keyrings
+    run sh -c "curl -fsSL https://download.docker.com/linux/${id}/gpg -o /etc/apt/keyrings/docker.asc"
+    write_file /etc/apt/sources.list.d/docker.list 0644 <<<"deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${id} ${codename} stable" || true
+    run apt-get update -qq
+    run apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    changed "installed Docker"
+  fi
+  if write_file /etc/docker/daemon.json 0644 <<'JSON'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "live-restore": true,
+  "no-new-privileges": true
+}
+JSON
+  then
+    if has_systemd && ! in_container && [[ "$DRY_RUN" != 1 ]]; then systemctl restart docker; fi
+    changed "Docker daemon: log rotation, live-restore, no-new-privileges"
+  fi
+  if ! id -nG "$USER_NAME" 2>/dev/null | grep -qw docker; then
+    run usermod -aG docker "$USER_NAME"
+    changed "${USER_NAME} added to docker group"
+  fi
+}
+
+summary() {
+  if [[ ${#CHANGED[@]} -eq 0 ]]; then
+    ok "nothing to do: host already matches the baseline"
+  else
+    ok "${#CHANGED[@]} change(s) applied$([[ "$DRY_RUN" == 1 ]] && echo ' (dry run)')"
+  fi
+}
+
+main() {
+  parse_args "$@"
+  [[ "$DRY_RUN" == 1 ]] && LOG_FILE=""
+  preflight
+  install_packages
+  configure_user
+  harden_ssh
+  configure_firewall
+  configure_fail2ban
+  configure_auto_updates
+  configure_kernel
+  configure_journald
+  configure_timezone
+  configure_swap
+  install_docker
+  summary
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
