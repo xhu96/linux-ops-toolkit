@@ -9,6 +9,11 @@ setup() {
   echo "0.50 0.40 0.30 1/200 1234" >"$FIX/loadavg"
   export MEMINFO="$FIX/meminfo" LOADAVG="$FIX/loadavg" NPROC=2
   export DF_CMD="cat $FIX/df" DF_INODE_CMD="cat $FIX/dfi"
+  # Stub systemctl so the real host's failed units don't leak into the tests.
+  mkdir -p "$FIX/bin"
+  printf '#!/bin/sh\nexit 0\n' >"$FIX/bin/systemctl"
+  chmod +x "$FIX/bin/systemctl"
+  export PATH="$FIX/bin:$PATH"
   df_with 40 10
 }
 
