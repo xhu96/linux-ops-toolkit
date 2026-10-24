@@ -17,7 +17,7 @@ jobs:
     name: ShellCheck + bats
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: shellcheck -x bin/* lib/*.sh tests/integration/*.sh
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
       - run: bats tests/bats
@@ -26,7 +26,7 @@ jobs:
     name: opskit lint + tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -44,7 +44,7 @@ jobs:
       matrix:
         image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: tests/integration/run.sh "${{ matrix.image }}"
 
   integration-vm:
@@ -54,7 +54,7 @@ jobs:
     needs: shell
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Run bootstrap-server
         run: |
           key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForIntegrationOnly test@ci"
