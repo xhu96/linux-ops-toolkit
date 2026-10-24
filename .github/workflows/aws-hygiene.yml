@@ -1,0 +1,33 @@
+name: AWS hygiene report
+
+# Weekly read-only report in the job summary: idle resources, missing tags and
+# spend. Skipped until the repo variable AWS_HYGIENE_ROLE_ARN is set.
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  report:
+    if: vars.AWS_HYGIENE_ROLE_ARN != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_HYGIENE_ROLE_ARN }}
+          aws-region: eu-west-2
+      - name: Idle resources
+        run: opskit waste || echo "::warning::idle resources found"
+      - name: Tag compliance
+        run: opskit tag-audit --required Project,Owner,Environment || echo "::warning::untagged resources found"
+      - name: Spend
+        run: opskit cost --days 30

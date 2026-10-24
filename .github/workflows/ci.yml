@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: ShellCheck + bats
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: shellcheck -x bin/* lib/*.sh tests/integration/*.sh
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
+      - run: bats tests/bats
+
+  python:
+    name: opskit lint + tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check . && ruff format --check .
+      - run: pytest
+
+  integration:
+    name: bootstrap-server on ${{ matrix.image }}
+    needs: shell
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12"]
+    steps:
+      - uses: actions/checkout@v5
+      - run: tests/integration/run.sh "${{ matrix.image }}"
+
+  integration-vm:
+    # A container cannot exercise ufw, sysctl, swap or systemd. The runner is a
+    # real Ubuntu VM, so run the full script there too (including Docker).
+    name: bootstrap-server on a real VM
+    needs: shell
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run bootstrap-server
+        run: |
+          key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForIntegrationOnly test@ci"
+          sudo bin/bootstrap-server --user deploy --ssh-key "$key" --swap 0
+      - name: Second run is a no-op
+        run: |
+          key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyForIntegrationOnly test@ci"
+          sudo bin/bootstrap-server --user deploy --ssh-key "$key" --swap 0 2>&1 | tee run2.log
+          grep -q "nothing to do" run2.log
+      - name: Verify
+        run: |
+          sudo sshd -t
+          sudo ufw status | grep -q "Status: active"
+          sudo ufw status | grep -q "22/tcp"
+          test "$(sysctl -n net.ipv4.tcp_syncookies)" = 1
+          systemctl is-active --quiet fail2ban
+          sudo -u deploy sudo -n true
+          id -nG deploy | grep -qw docker
+          jq -e '."log-opts"."max-size" == "10m"' /etc/docker/daemon.json
+      - name: Healthcheck on the hardened host
+        run: bin/healthcheck --service fail2ban --service docker --json | tee hc.json; jq -e '.checks | length > 0' hc.json

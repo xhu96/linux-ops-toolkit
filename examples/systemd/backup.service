@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly backup of /etc and /srv
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup --dest /var/backups/host --keep 14 /etc /srv
+Nice=10
+IOSchedulingClass=idle

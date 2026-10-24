@@ -1,0 +1,8 @@
+[Unit]
+Description=Host health check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/healthcheck --service fail2ban
+# Exit 1/2 marks the unit failed, so `systemctl --failed` and the journal show it.
+SuccessExitStatus=0
