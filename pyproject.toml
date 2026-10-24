@@ -7,7 +7,7 @@ name = "opskit"
 version = "0.1.0"
 description = "AWS housekeeping CLI: ECR cleanup, tag compliance, idle resources, cost report"
 requires-python = ">=3.11"
-dependencies = ["boto3>=1.35"]
+dependencies = ["boto3>=1.43.116"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "moto[ec2,ecr,resourcegroupstaggingapi]>=5", "ruff>=0.7"]
